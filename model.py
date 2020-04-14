@@ -1,5 +1,6 @@
-#!/usr/bin/python2.7
 import os
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,67 +11,134 @@ import numpy as np
 import pandas as pd
 
 
-class MultiStageModel(nn.Module):
-    def __init__(self, num_stages, num_layers, num_f_maps, dim, num_classes):
-        super(MultiStageModel, self).__init__()
-        self.stage1 = SingleStageModel(num_layers, num_f_maps, dim, num_classes)
-        self.stages = nn.ModuleList([copy.deepcopy(SingleStageModel(num_layers, num_f_maps, num_classes, num_classes)) for s in range(num_stages-1)])
+class BatchLoader:
+    def __init__(self, num_classes, actions_dict, gt_path, features_path):
+        self.videos = []
+        self.current_index = 0
+        self.num_classes = num_classes
+        self.actions_dict = actions_dict
+        self.gt_folder = gt_path
+        self.features_folder = features_path
+
+    def reset(self):
+        self.current_index = 0
+        random.shuffle(self.videos)
+
+    def has_next(self):
+        return self.current_index < len(self.videos)
+
+    def read_vid_list(self, vid_list_file):
+        file_ptr = open(vid_list_file, 'r')
+        self.videos = file_ptr.read().split('\n')[:-1]
+        file_ptr.close()
+        random.shuffle(self.videos)
+
+    def next_batch(self, batch_size):
+        batch = self.videos[self.current_index:self.current_index + batch_size]
+        self.current_index += batch_size
+
+        batch_input = []
+        batch_labels = []
+        for vid in batch:
+            vid_name = vid.split('/')[3]
+            features = np.load(os.path.join(self.features_folder, vid_name.split('.')[0] + '.npy')).T
+            file_ptr = open(self.gt_folder + vid_name, 'r')
+            content = file_ptr.read().split('\n')[:-1]
+            classes = np.zeros(min(np.shape(features)[1], len(content)))
+            for i in range(len(classes)):
+                classes[i] = self.actions_dict[content[i]]
+            batch_input.append(features[:, ::1])
+            batch_labels.append(classes[::1])
+
+        length_of_sequences = list(map(len, batch_labels))
+        batch_input_tensor = torch.zeros(len(batch_input), np.shape(batch_input[0])[0], max(length_of_sequences), dtype=torch.float)
+        batch_label_tensor = torch.ones(len(batch_input), max(length_of_sequences), dtype=torch.long)*(-100)
+        mask = torch.zeros(len(batch_input), self.num_classes, max(length_of_sequences), dtype=torch.float)
+        for i in range(len(batch_input)):
+            batch_input_tensor[i, :, :np.shape(batch_input[i])[1]] = torch.from_numpy(batch_input[i])
+            batch_label_tensor[i, :np.shape(batch_labels[i])[0]] = torch.from_numpy(batch_labels[i])
+            mask[i, :, :np.shape(batch_labels[i])[0]] = torch.ones(self.num_classes, np.shape(batch_labels[i])[0])
+
+        return batch_input_tensor, batch_label_tensor, mask
+
+
+class VideoActionsModel(nn.Module):
+    def __init__(self, num_blocks, num_layers, num_channels, i3d_dim, num_classes):
+        super(VideoActionsModel, self).__init__()
+        self.block0 = SingleBlock(num_layers, num_channels, i3d_dim, num_classes)
+        self.blocks = []
+        for i in range(num_blocks):
+            self.blocks.append(copy.deepcopy(SingleBlock(num_layers, num_channels, num_classes, num_classes)))
+        self.blocks = nn.ModuleList(self.blocks)
 
     def forward(self, x, mask):
-        out = self.stage1(x, mask)
+        out = self.block0(x, mask)
         outputs = out.unsqueeze(0)
-        for s in self.stages:
-            out = s(F.softmax(out, dim=1) * mask[:, 0:1, :], mask)
+        for block in self.blocks:
+            out = block(F.softmax(out, dim=1) * mask[:, 0:1, :], mask)
             outputs = torch.cat((outputs, out.unsqueeze(0)), dim=0)
         return outputs
 
 
-class SingleStageModel(nn.Module):
-    def __init__(self, num_layers, num_f_maps, dim, num_classes):
-        super(SingleStageModel, self).__init__()
-        self.conv_1x1 = nn.Conv1d(dim, num_f_maps, 1)
-        self.layers = nn.ModuleList([copy.deepcopy(DilatedResidualLayer(2 ** i, num_f_maps, num_f_maps)) for i in range(num_layers)])
-        self.conv_out = nn.Conv1d(num_f_maps, num_classes, 1)
+class SingleBlock(nn.Module):
+    def __init__(self, num_layers, num_channels, i3d_dim, num_classes):
+        super(SingleBlock, self).__init__()
+        self.conv_1x1 = nn.Conv1d(i3d_dim, num_channels, 1)
+        self.pool_1x3 = nn.MaxPool1d(kernel_size=3, padding=1, stride=1)
+
+        self.layers = []
+        for i in range(num_layers):
+            self.layers.append(copy.deepcopy(ResidualLayer(2 ** i, num_channels)))
+        self.layers = nn.ModuleList(self.layers)
+        self.conv_out = nn.Conv1d(num_channels, num_classes, 1)
 
     def forward(self, x, mask):
         out = self.conv_1x1(x)
+        out = self.pool_1x3(out)
         for layer in self.layers:
             out = layer(out, mask)
         out = self.conv_out(out) * mask[:, 0:1, :]
         return out
 
 
-class DilatedResidualLayer(nn.Module):
-    def __init__(self, dilation, in_channels, out_channels):
-        super(DilatedResidualLayer, self).__init__()
-        self.conv_dilated = nn.Conv1d(in_channels, out_channels, 3, padding=dilation, dilation=dilation)
-        self.conv_1x1 = nn.Conv1d(out_channels, out_channels, 1)
+class ResidualLayer(nn.Module):
+    def __init__(self, dilation, num_channels):
+        super(ResidualLayer, self).__init__()
+        self.conv_dilated = nn.Conv1d(num_channels, num_channels, 3, padding=dilation, dilation=dilation)
+        self.conv_1x1 = nn.Conv1d(num_channels, num_channels, 1)
+        self.pool_1x3 = nn.MaxPool1d(kernel_size=3, padding=1, stride=1)
+        self.batch_norm = nn.BatchNorm1d(num_channels)
         self.dropout = nn.Dropout()
 
     def forward(self, x, mask):
         out = F.relu(self.conv_dilated(x))
         out = self.conv_1x1(out)
+        out = self.pool_1x3(out)
+        out = self.batch_norm(out)
         out = self.dropout(out)
         return (x + out) * mask[:, 0:1, :]
 
 
-class Trainer:
+class Runner:
     def __init__(self, num_blocks, num_layers, num_f_maps, dim, num_classes):
-        self.model = MultiStageModel(num_blocks, num_layers, num_f_maps, dim, num_classes)
+        self.model = VideoActionsModel(num_blocks, num_layers, num_f_maps, dim, num_classes)
         self.ce = nn.CrossEntropyLoss(ignore_index=-100)
         self.mse = nn.MSELoss(reduction='none')
         self.num_classes = num_classes
 
-    def train(self, save_dir, batch_gen, num_epochs, batch_size, learning_rate, device):
+    def train(self, save_dir, loader, end_epoch, batch_size, learning_rate, weight_decay, device, start_epoch):
         self.model.train()
         self.model.to(device)
-        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-        for epoch in range(num_epochs):
+        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        if start_epoch > 0:
+            self.model.load_state_dict(torch.load(save_dir + "/epoch-" + str(start_epoch) + ".model"))
+            optimizer.load_state_dict(torch.load(save_dir + "/epoch-" + str(start_epoch) + ".opt"))
+        for epoch in range(start_epoch, end_epoch):
             epoch_loss = 0
             correct = 0
             total = 0
-            while batch_gen.has_next():
-                batch_input, batch_target, mask = batch_gen.next_batch(batch_size)
+            while loader.has_next():
+                batch_input, batch_target, mask = loader.next_batch(batch_size)
                 batch_input, batch_target, mask = batch_input.to(device), batch_target.to(device), mask.to(device)
                 optimizer.zero_grad()
                 predictions = self.model(batch_input, mask)
@@ -88,10 +156,10 @@ class Trainer:
                 correct += ((predicted == batch_target).float()*mask[:, 0, :].squeeze(1)).sum().item()
                 total += torch.sum(mask[:, 0, :]).item()
 
-            batch_gen.reset()
+            loader.reset()
             torch.save(self.model.state_dict(), save_dir + "/epoch-" + str(epoch + 1) + ".model")
             torch.save(optimizer.state_dict(), save_dir + "/epoch-" + str(epoch + 1) + ".opt")
-            print("[epoch %d]: epoch loss = %f,   acc = %f" % (epoch + 1, epoch_loss / len(batch_gen.list_of_examples),
+            print("[epoch %d]: epoch loss = %f,   acc = %f" % (epoch + 1, epoch_loss / len(loader.videos),
                                                                float(correct)/total))
 
     def segment_result(self, result, segment_file_path, result_path):
@@ -115,32 +183,25 @@ class Trainer:
         df.index.name = 'Id'
         df.to_csv(os.path.join(result_path, 'res.csv'), index=True)
 
-    def predict(self, model_dir, results_dir, features_path, vid_list_file, epoch, actions_dict, device, sample_rate, segment_file):
+    def predict(self, model_folder, results_folder, features_path, vid_list_file, epoch, device, segment_file):
         self.model.eval()
         with torch.no_grad():
             self.model.to(device)
-            self.model.load_state_dict(torch.load(model_dir + "/epoch-" + str(epoch) + ".model"))
+            self.model.load_state_dict(torch.load(model_folder + "/epoch-" + str(epoch) + ".model"))
             file_ptr = open(vid_list_file, 'r')
             list_of_vids = file_ptr.read().split('\n')[:-1]
             file_ptr.close()
             result = []
             for vid in list_of_vids:
-                print(vid)
                 vid_name = vid.split('/')[3]
                 features = np.load(os.path.join(features_path, vid_name.split('.')[0] + '.npy')).T
-                features = features[:, ::sample_rate]
+                features = features[:, ::1]
                 input_x = torch.tensor(features, dtype=torch.float)
                 input_x.unsqueeze_(0)
                 input_x = input_x.to(device)
                 predictions = self.model(input_x, torch.ones(input_x.size(), device=device))
                 _, predicted = torch.max(predictions[-1].data, 1)
                 predicted = predicted.squeeze()
-                # recognition = []
                 result.append(predicted.tolist())
-                # for i in range(len(predicted)):
-                #     recognition = np.concatenate((recognition, [list(actions_dict.keys())[list(actions_dict.values()).index(predicted[i].item())]]*sample_rate))
-            # f_name = 'epoch_' + str(epoch)
-            # f_ptr = open(results_dir + "/" + f_name, "w")
-            # f_ptr.write('\n'.join(result))
-            # f_ptr.close()
-            self.segment_result(result, segment_file, results_dir)
+            self.segment_result(result, segment_file, results_folder)
+

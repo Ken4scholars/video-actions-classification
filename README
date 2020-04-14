@@ -1,0 +1,6 @@
+Instructions on how to run the program:
+1. Run read_datasetBreakfast.py with split = 'training' to extract i3d features of the training data and save as .npy files
+2. Run the same file with split = 'test' to extract features for test data
+3. Run main.ipynb/main.py with action train to train the model
+4. Change action in main.ipynb/main.py to "predict", then run the prediction
+5. Find segmented predictions in data/results/res.csv

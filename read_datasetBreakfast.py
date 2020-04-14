@@ -29,11 +29,14 @@ def load_data(split_load, actions_dict, GT_folder, DATA_folder, features_folder,
             curr_gt = file_ptr.read().split('\n')[:-1]
             loc_curr_data = DATA_folder + os.path.splitext(content)[0] + '.gz'
             curr_data = np.loadtxt(loc_curr_data, dtype='float32')
+
+            # save the extracted features as numpy data files
             feature_name = features_folder + os.path.splitext(content)[0] + '.npy'
             np.save(feature_name, curr_data)
+
             label_curr_video = []
             for iik in range(len(curr_gt)):
-                label_curr_video.append( actions_dict[curr_gt[iik]] )
+                label_curr_video.append(actions_dict[curr_gt[iik]] )
 
             data_breakfast.append(torch.tensor(curr_data,  dtype=torch.float64 ) )
             labels_breakfast.append(label_curr_video )
@@ -43,8 +46,7 @@ def load_data(split_load, actions_dict, GT_folder, DATA_folder, features_folder,
         return  data_breakfast, labels_uniq
     if datatype == 'test':
         data_breakfast = []
-        
-        segment = []
+
         for content in content_all:
             
             #file_ptr = open( GT_folder + content, 'r')
@@ -53,6 +55,8 @@ def load_data(split_load, actions_dict, GT_folder, DATA_folder, features_folder,
             loc_curr_data = DATA_folder + os.path.splitext(content)[0] + '.gz'
         
             curr_data = np.loadtxt(loc_curr_data, dtype='float32')
+
+            # save the extracted features as numpy data files
             feature_name = features_folder + os.path.splitext(content)[0] + '.npy'
             np.save(feature_name, curr_data)
                                  
@@ -125,13 +129,18 @@ if __name__ == "__main__":
     mapping_loc =  os.path.join(COMP_PATH, 'splits/mapping_bf.txt')
     train_features_folder = os.path.join(COMP_PATH, 'train_features/')
     test_features_folder = os.path.join(COMP_PATH, 'test_features/')
+
+    if not os.path.exists(train_features_folder):
+        os.makedirs(train_features_folder)
+    if not os.path.exists(test_features_folder):
+        os.makedirs(test_features_folder)
   
     actions_dict = read_mapping_dict(mapping_loc)
     if  split == 'training':
-        data_feat, data_labels = load_data(train_split, actions_dict, GT_folder, DATA_folder, train_features_folder, datatype = split)
+        data_feat, data_labels = load_data(train_split, actions_dict, GT_folder, DATA_folder, train_features_folder, datatype=split)
         
     if  split == 'test':
-        data_feat = load_data(test_split, actions_dict, GT_folder, DATA_folder, test_features_folder, datatype = split)
+        data_feat = load_data(test_split, actions_dict, GT_folder, DATA_folder, test_features_folder, datatype=split)
     
  
 
